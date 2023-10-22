@@ -31,6 +31,7 @@ import io.trino.client.StatementStats;
 import io.trino.execution.ExecutionFailureInfo;
 import io.trino.execution.QueryManagerConfig;
 import io.trino.execution.QueryState;
+import io.trino.llm.NL2SqlParser;
 import io.trino.server.HttpRequestSessionContextFactory;
 import io.trino.server.ProtocolConfig;
 import io.trino.server.ServerConfig;
@@ -123,6 +124,8 @@ public class QueuedStatementResource
     private final Optional<String> alternateHeaderName;
     private final QueryManager queryManager;
 
+    private final NL2SqlParser nl2SqlParser;
+
     @Inject
     public QueuedStatementResource(
             HttpRequestSessionContextFactory sessionContextFactory,
@@ -132,7 +135,7 @@ public class QueuedStatementResource
             QueryInfoUrlFactory queryInfoUrlTemplate,
             ServerConfig serverConfig,
             ProtocolConfig protocolConfig,
-            QueryManagerConfig queryManagerConfig)
+            QueryManagerConfig queryManagerConfig, NL2SqlParser nl2SqlParser)
     {
         this.sessionContextFactory = requireNonNull(sessionContextFactory, "sessionContextFactory is null");
         this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
@@ -143,6 +146,7 @@ public class QueuedStatementResource
         this.compressionEnabled = serverConfig.isQueryResultsCompressionEnabled();
         this.alternateHeaderName = protocolConfig.getAlternateHeaderName();
         queryManager = new QueryManager(queryManagerConfig.getClientTimeout());
+        this.nl2SqlParser = nl2SqlParser;
     }
 
     @PostConstruct
@@ -169,7 +173,9 @@ public class QueuedStatementResource
         if (isNullOrEmpty(statement)) {
             throw badRequest(BAD_REQUEST, "SQL statement is empty");
         }
-
+        if (statement.contains("?")) {
+            statement = nl2SqlParser.translateToSql(statement);
+        }
         Query query = registerQuery(statement, servletRequest, httpHeaders);
 
         return createQueryResultsResponse(query.getQueryResults(query.getLastToken(), uriInfo));

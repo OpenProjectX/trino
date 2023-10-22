@@ -39,6 +39,8 @@ import io.airlift.node.NodeModule;
 import io.airlift.openmetrics.JmxOpenMetricsModule;
 import io.airlift.tracetoken.TraceTokenModule;
 import io.airlift.tracing.TracingModule;
+import io.trino.Session;
+import io.trino.client.ClientCapabilities;
 import io.trino.client.NodeVersion;
 import io.trino.connector.CatalogManagerConfig;
 import io.trino.connector.CatalogManagerConfig.CatalogMangerKind;
@@ -49,10 +51,16 @@ import io.trino.eventlistener.EventListenerManager;
 import io.trino.eventlistener.EventListenerModule;
 import io.trino.exchange.ExchangeManagerModule;
 import io.trino.exchange.ExchangeManagerRegistry;
+import io.trino.execution.QueryIdGenerator;
 import io.trino.execution.resourcegroups.ResourceGroupManager;
 import io.trino.execution.warnings.WarningCollectorModule;
+import io.trino.llm.LLMModule;
+import io.trino.llm.LLMSqlClient;
+import io.trino.llm.TableMetadata;
 import io.trino.metadata.Catalog;
 import io.trino.metadata.CatalogManager;
+import io.trino.metadata.CatalogMetadata;
+import io.trino.metadata.SessionPropertyManager;
 import io.trino.security.AccessControlManager;
 import io.trino.security.AccessControlModule;
 import io.trino.security.GroupProviderManager;
@@ -61,7 +69,9 @@ import io.trino.server.security.HeaderAuthenticatorManager;
 import io.trino.server.security.PasswordAuthenticatorManager;
 import io.trino.server.security.ServerSecurityModule;
 import io.trino.server.security.oauth2.OAuth2Client;
-import io.trino.spi.connector.CatalogHandle;
+import io.trino.spi.connector.*;
+import io.trino.spi.security.Identity;
+import io.trino.transaction.TransactionId;
 import io.trino.transaction.TransactionManagerModule;
 import io.trino.version.EmbedVersion;
 import org.weakref.jmx.guice.MBeanModule;
@@ -70,29 +80,27 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Collection;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
+import java.util.stream.Stream;
 
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static io.airlift.discovery.client.ServiceAnnouncement.ServiceAnnouncementBuilder;
 import static io.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
 import static io.trino.server.TrinoSystemRequirements.verifyJvmRequirements;
 import static io.trino.server.TrinoSystemRequirements.verifySystemTimeIsReasonable;
+import static io.trino.spi.transaction.IsolationLevel.READ_UNCOMMITTED;
 import static java.lang.String.format;
 import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
+import static java.util.Locale.ENGLISH;
 import static java.util.function.Predicate.not;
 import static java.util.stream.Collectors.joining;
 
-public class Server
-{
-    public final void start(String trinoVersion)
-    {
+public class Server {
+    public final void start(String trinoVersion) {
         new EmbedVersion(trinoVersion).embedVersion(() -> doStart(trinoVersion)).run();
     }
 
-    private void doStart(String trinoVersion)
-    {
+    private void doStart(String trinoVersion) {
         verifyJvmRequirements();
         verifySystemTimeIsReasonable();
 
@@ -125,7 +133,8 @@ public class Server
                 new TransactionManagerModule(),
                 new ServerMainModule(trinoVersion),
                 new GracefulShutdownModule(),
-                new WarningCollectorModule());
+                new WarningCollectorModule(),
+                new LLMModule());
 
         modules.addAll(getAdditionalModules());
 
@@ -155,6 +164,59 @@ public class Server
 
                 // TODO: remove this huge hack
                 updateConnectorIds(injector.getInstance(Announcer.class), catalogManager);
+                SessionPropertyManager sessionPropertyManager = injector.getInstance(SessionPropertyManager.class);
+                List<TableMetadata> tableMetadataList = catalogManager.getCatalogNames().stream()
+                        .map(catalogManager::getCatalog)
+                        .flatMap(Optional::stream)
+                        .filter((not(Catalog::isFailed)))
+//                        .map(get)
+                        .flatMap(catalog -> {
+                            final QueryIdGenerator queryIdGenerator = new QueryIdGenerator();
+                            Session session = Session.builder(sessionPropertyManager)
+                                    .setQueryId(queryIdGenerator.createNextQueryId())
+                                    .setIdentity(Identity.ofUser("user"))
+                                    .setOriginalIdentity(Identity.ofUser("user"))
+                                    .setSource("test")
+                                    .setCatalog("catalog")
+                                    .setSchema("schema")
+                                    .setLocale(ENGLISH)
+                                    .setClientCapabilities(Arrays.stream(ClientCapabilities.values()).map(Enum::name)
+                                            .collect(toImmutableSet()))
+                                    .setRemoteUserAddress("address")
+                                    .setUserAgent("agent")
+//                                    .setCatalogSessionProperty()
+                                    .build();
+                            TransactionId transactionId = TransactionId.create();
+                            CatalogMetadata catalogMetadata = catalog.beginTransaction(transactionId, READ_UNCOMMITTED, true, true);
+                            ConnectorMetadata metadata = catalogMetadata.getMetadata(session);
+                            try {
+                                ConnectorSession connectorSession = session.toConnectorSession(catalog.getCatalogHandle());
+                                return metadata.listTables(connectorSession, Optional.of("llm"))
+                                        .stream()
+                                        .map(schemaTableName -> {
+                                            ConnectorTableHandle tableHandle = metadata.getTableHandle(connectorSession, schemaTableName, Optional.empty(), Optional.empty());
+                                            ConnectorTableMetadata tableMetadata = metadata.getTableMetadata(connectorSession, tableHandle);
+                                            return new TableMetadata()
+                                                    .setCatalog(catalog.getCatalogName())
+                                                    .setSchema(tableMetadata.getTableSchema().getTable().getSchemaName())
+                                                    .setTable(tableMetadata.getTableSchema().getTable().getTableName())
+                                                    .setColumns(tableMetadata.getColumns())
+                                                    .setProperties(tableMetadata.getProperties())
+                                                    .setCheckConstraints(tableMetadata.getCheckConstraints())
+                                                    .setComment(tableMetadata.getComment().orElse(""));
+                                        });
+
+                            } catch (Exception error) {
+                                log.warn("error on getting metadata for %s", catalog);
+                                return Stream.empty();
+                            }
+                        })
+                        .toList();
+                log.info("tableMetadataList %s", tableMetadataList);
+                LLMSqlClient llmSqlClient = injector.getInstance(LLMSqlClient.class);
+                String response = llmSqlClient.initMetadata(tableMetadataList);
+                log.info("init response %s", response);
+
             }
 
             injector.getInstance(SessionPropertyDefaults.class).loadConfigurationManager();
